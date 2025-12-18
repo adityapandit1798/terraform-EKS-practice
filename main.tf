@@ -112,8 +112,10 @@ resource "aws_route_table_association" "private_assoc" {
 
 
 
-#We need a policy that says: "Allow the service eks.amazonaws.com to assume this role."
-data aws_iam_policy_document "eks_assume_role_policy" {
+# --- 1. CLUSTER ROLE (Control Plane) ---
+
+# Trust Policy: Allow EKS Service to assume this role
+data "aws_iam_policy_document" "cluster_assume_role" {
   statement {
     effect = "Allow"
     principals {
@@ -124,20 +126,22 @@ data aws_iam_policy_document "eks_assume_role_policy" {
   }
 }
 
-#Role 
-resource "aws_iam_role" "eks-cluster-role" {
-  assume_role_policy = data.eks_assume_role_policy.eks.json
-  name = "eks-cluster-role"
+# Create the Cluster Role
+resource "aws_iam_role" "cluster_role" {
+  name               = "eks-terraform-cluster-role"
+  assume_role_policy = data.aws_iam_policy_document.cluster_assume_role.json
 }
 
-#attach managed policies to the role
-resource "aws_iam_role_policy_attachment" "attach-cluster-role-policy" {
-  role       = aws_iam_role.eks-cluster-role.name
+# Attach the Cluster Policy
+resource "aws_iam_role_policy_attachment" "cluster_policy" {
+  role       = aws_iam_role.cluster_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
 }
 
-#policy document for Node group role
-data aws_iam_policy_document "eks_assume_role_policy" {
+# --- 2. NODE ROLE (Worker Nodes) ---
+
+# Trust Policy: Allow EC2 Service to assume this role
+data "aws_iam_policy_document" "node_assume_role" {
   statement {
     effect = "Allow"
     principals {
@@ -148,13 +152,80 @@ data aws_iam_policy_document "eks_assume_role_policy" {
   }
 }
 
-resource "aws_iam_role" "eks-nodegroup-role" {
-  assume_role_policy = data.eks_assume_role_policy.eks.json
-  name = "eks-nodegroup-role"
+# Create the Node Role
+resource "aws_iam_role" "node_role" {
+  name               = "eks-terraform-node-role"
+  assume_role_policy = data.aws_iam_policy_document.node_assume_role.json
 }
 
-#attach managed policies to the role
-resource "aws_iam_role_policy_attachment" "attach-nodegroup-role-policy" {
-  role       = aws_iam_role.eks-cluster-role.name
-  policy_arn = ["arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy" ,"arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy", "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"]
+# Attach the 3 Node Policies using a Loop (for_each)
+resource "aws_iam_role_policy_attachment" "node_policies" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  ])
+
+  role       = aws_iam_role.node_role.name
+  policy_arn = each.value
+}
+
+
+
+
+#EKS Cluster
+resource "aws_eks_cluster" "main" {
+  name = "eks-terraform-cluster"
+  role_arn = aws_iam_role.cluster_role.arn
+
+  vpc_config {
+    subnet_ids = concat(aws_subnet.public[*].id, aws_subnet.private[*].id)
+  }
+  depends_on = [ aws_iam_role_policy_attachment.cluster_policy ]
+}
+
+# --- WORKER NODES ---
+resource "aws_eks_node_group" "node-group" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "node-group-1"
+  node_role_arn   = aws_iam_role.node_role.arn
+  subnet_ids      = aws_subnet.private[*].id
+
+  scaling_config {
+    desired_size = 1
+    max_size     = 2
+    min_size     = 1
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  # Ensure that IAM Role permissions are created before and deleted after EKS Node Group handling.
+  # Otherwise, EKS will not be able to properly delete EC2 Instances and Elastic Network Interfaces.
+  depends_on = [
+    aws_iam_role_policy_attachment.node_policies["arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"],
+    aws_iam_role_policy_attachment.node_policies["arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"],
+    aws_iam_role_policy_attachment.node_policies["arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"],
+  ]
+}
+
+
+output "cluster_name" {
+  description = "Kubernetes Cluster Name"
+  value       = aws_eks_cluster.main.name
+}
+
+output "cluster_endpoint" {
+  description = "Endpoint for EKS control plane"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "region" {
+  description = "AWS region"
+  value       = var.region
+}
+
+output "update_kubeconfig_command" {
+  value = "aws eks update-kubeconfig --region ${var.region} --name ${aws_eks_cluster.main.name}"
 }
